@@ -224,9 +224,6 @@ class GPT2Attention(nn.Module):
         sin_rotation=None,
     ):
         if cos_rotation is not None and sin_rotation is not None:
-            print("query:", query.shape)
-            print("cos_rotation:", cos_rotation.shape)
-            print("sin_rotation:", sin_rotation.shape)
             query = apply_rope_embeddings(query, cos_rotation, sin_rotation)
             key = apply_rope_embeddings(key, cos_rotation, sin_rotation)
 

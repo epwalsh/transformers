@@ -128,9 +128,7 @@ class RoPE(torch.nn.Module):
     following https://blog.eleuther.ai/rotary-embeddings/.
     """
 
-    def __init__(
-        self, d_model: int, base: int = 10000
-    ) -> None:
+    def __init__(self, d_model: int, base: int = 10000) -> None:
         super().__init__()
         # Shape: (d_model / 2,)
         inv_freq = 1.0 / (base ** (torch.arange(0, d_model, 2).float() / d_model))

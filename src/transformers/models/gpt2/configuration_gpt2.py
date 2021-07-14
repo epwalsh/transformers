@@ -156,6 +156,7 @@ class GPT2Config(PretrainedConfig):
         use_cache=True,
         bos_token_id=50256,
         eos_token_id=50256,
+        rotary_embeddings=False,
         **kwargs
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -184,6 +185,8 @@ class GPT2Config(PretrainedConfig):
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+
+        self.rotary_embeddings = rotary_embeddings
 
     @property
     def max_position_embeddings(self):

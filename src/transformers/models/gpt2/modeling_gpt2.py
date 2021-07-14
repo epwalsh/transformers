@@ -122,6 +122,47 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     return model
 
 
+class RoPE(torch.nn.Module):
+    """
+    Applies Rotary Positional Embeddings (RoPE) to query/key matrices in self-attention
+    following https://blog.eleuther.ai/rotary-embeddings/.
+    """
+
+    def __init__(
+        self, d_model: int, base: int = 10000
+    ) -> None:
+        super().__init__()
+        # Shape: (d_model / 2,)
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_model, 2).float() / d_model))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """
+        `position_ids` should have shape `(batch_size, seq_len)`.
+        """
+        # Shape: (batch_size, seq_len, d_model / 2)
+        rotation_angle = torch.einsum("bi,j->bij", position_ids, self.inv_freq)
+        # Shape: (batch_size, seq_len, d_model)
+        rotation_angle = torch.cat((rotation_angle, rotation_angle), dim=-1).to(position_ids.device)
+        # Shape (both): (batch_size, 1, seq_len, d_model)
+        cos_rotation = rotation_angle.cos()[:, None, :, :]
+        sin_rotation = rotation_angle.sin()[:, None, :, :]
+        return cos_rotation, sin_rotation
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=x1.ndim - 1)  # dim=-1 triggers a bug in torch < 1.8.0
+
+
+def apply_rope_embeddings(
+    x: torch.Tensor,
+    cos_rotation: torch.Tensor,
+    sin_rotation: torch.Tensor,
+) -> torch.Tensor:
+    return (x * cos_rotation) + (_rotate_half(x) * sin_rotation)
+
+
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False):
         super().__init__()
@@ -174,7 +215,20 @@ class GPT2Attention(nn.Module):
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+    def _attn(
+        self,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        head_mask=None,
+        cos_rotation=None,
+        sin_rotation=None,
+    ):
+        if cos_rotation is not None and sin_rotation is not None:
+            query = apply_rope_embeddings(query, cos_rotation, sin_rotation)
+            key = apply_rope_embeddings(key, cos_rotation, sin_rotation)
+
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
@@ -225,6 +279,8 @@ class GPT2Attention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        cos_rotation=None,
+        sin_rotation=None,
         use_cache=False,
         output_attentions=False,
     ):
@@ -255,7 +311,15 @@ class GPT2Attention(nn.Module):
         else:
             present = None
 
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        attn_output, attn_weights = self._attn(
+            query,
+            key,
+            value,
+            attention_mask,
+            head_mask,
+            cos_rotation,
+            sin_rotation,
+        )
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
@@ -309,6 +373,8 @@ class GPT2Block(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        cos_rotation=None,
+        sin_rotation=None,
         use_cache=False,
         output_attentions=False,
     ):
@@ -319,6 +385,8 @@ class GPT2Block(nn.Module):
             layer_past=layer_past,
             attention_mask=attention_mask,
             head_mask=head_mask,
+            cos_rotation=cos_rotation,
+            sin_rotation=sin_rotation,
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
@@ -343,6 +411,8 @@ class GPT2Block(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
+                cos_rotation=cos_rotation,
+                sin_rotation=sin_rotation,
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -577,7 +647,12 @@ class GPT2Model(GPT2PreTrainedModel):
         self.embed_dim = config.hidden_size
 
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+
+        self.use_rotary_embeddings = config.rotary_embeddings
+        if self.use_rotary_embeddings:
+            self.wpe = RoPE(config.embed_dim)
+        else:
+            self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config) for _ in range(config.num_hidden_layers)])
@@ -731,8 +806,13 @@ class GPT2Model(GPT2PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+
+        if self.use_rotary_embeddings:
+            cos_rotation, sin_rotation = self.wpe(position_ids)
+            hidden_states = inputs_embeds
+        else:
+            cos_rotation, sin_rotation = None, None
+            hidden_states = inputs_embeds + self.wpe(position_ids)
 
         if token_type_ids is not None:
             token_type_embeds = self.wte(token_type_ids)
@@ -786,6 +866,8 @@ class GPT2Model(GPT2PreTrainedModel):
                     head_mask[i],
                     encoder_hidden_states,
                     encoder_attention_mask,
+                    cos_rotation,
+                    sin_rotation,
                 )
             else:
                 outputs = block(
@@ -795,6 +877,8 @@ class GPT2Model(GPT2PreTrainedModel):
                     head_mask=head_mask[i],
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
+                    cos_rotation=cos_rotation,
+                    sin_rotation=sin_rotation,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )

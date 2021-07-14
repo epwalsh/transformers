@@ -128,21 +128,21 @@ class RoPE(torch.nn.Module):
     following https://blog.eleuther.ai/rotary-embeddings/.
     """
 
-    def __init__(self, d_model: int, base: int = 10000) -> None:
+    def __init__(self, head_dim: int, base: int = 10000) -> None:
         super().__init__()
-        # Shape: (d_model / 2,)
-        inv_freq = 1.0 / (base ** (torch.arange(0, d_model, 2).float() / d_model))
+        # Shape: (head_dim / 2,)
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
         """
         `position_ids` should have shape `(batch_size, seq_len)`.
         """
-        # Shape: (batch_size, seq_len, d_model / 2)
+        # Shape: (batch_size, seq_len, head_dim / 2)
         rotation_angle = torch.einsum("bi,j->bij", position_ids, self.inv_freq)
-        # Shape: (batch_size, seq_len, d_model)
+        # Shape: (batch_size, seq_len, head_dim)
         rotation_angle = torch.cat((rotation_angle, rotation_angle), dim=-1).to(position_ids.device)
-        # Shape (both): (batch_size, 1, seq_len, d_model)
+        # Shape (both): (batch_size, 1, seq_len, head_dim)
         cos_rotation = rotation_angle.cos()[:, None, :, :]
         sin_rotation = rotation_angle.sin()[:, None, :, :]
         return cos_rotation, sin_rotation
@@ -224,6 +224,9 @@ class GPT2Attention(nn.Module):
         sin_rotation=None,
     ):
         if cos_rotation is not None and sin_rotation is not None:
+            print("query:", query.shape)
+            print("cos_rotation:", cos_rotation.shape)
+            print("sin_rotation:", sin_rotation.shape)
             query = apply_rope_embeddings(query, cos_rotation, sin_rotation)
             key = apply_rope_embeddings(key, cos_rotation, sin_rotation)
 
@@ -648,7 +651,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.use_rotary_embeddings = config.rotary_embeddings
         if self.use_rotary_embeddings:
-            self.wpe = RoPE(config.embed_dim)
+            self.wpe = RoPE(self.embed_dim // config.num_attention_heads)
         else:
             self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
